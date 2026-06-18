@@ -60,6 +60,7 @@ class AssistantConfig:
     claude_model: str = "claude-opus-4-8"
     elevenlabs_voice_id: str = ""
     elevenlabs_model_id: str = "eleven_turbo_v2"
+    tts_enabled: bool = True
     web_search_enabled: bool = True
     web_search_max_uses: int = 5
     local_tools_enabled: bool = True
@@ -855,7 +856,7 @@ def _blocks_to_params(content_blocks: list) -> list:
 # -----------------------------
 # Claude streaming + tool loop + sentence TTS
 # -----------------------------
-def chat_and_speak(messages: List[Dict[str, str]]) -> str:
+def chat_and_speak(messages: List[Dict[str, str]], speak: bool = True) -> str:
     """Stream Claude, handle tool calls, speak each sentence as it arrives."""
     full_response = ""
 
@@ -901,14 +902,15 @@ def chat_and_speak(messages: List[Dict[str, str]]) -> str:
                     if not search_announced:
                         search_announced = True
                         print("\n[searching…] ", end="", flush=True)
-                        _tts_elevenlabs("Let me look that up.")
+                        if speak:
+                            _tts_elevenlabs("Let me look that up.")
 
                 # Local tool call starting — announce what we're doing
                 elif event.type == "content_block_start" and btype == "tool_use":
                     name = getattr(event.content_block, "name", "tool")
                     announcement = _TOOL_ANNOUNCEMENTS.get(name, f"Using {name}.")
                     print(f"\n[{name}…] ", end="", flush=True)
-                    if announcement:
+                    if speak and announcement:
                         _tts_elevenlabs(announcement)
 
                 # Text chunk — speak sentence by sentence
@@ -925,7 +927,8 @@ def chat_and_speak(messages: List[Dict[str, str]]) -> str:
                             break
                         to_speak = sentence_buffer[:match.end()].strip()
                         sentence_buffer = sentence_buffer[match.end():]
-                        _tts_elevenlabs(to_speak)
+                        if speak:
+                            _tts_elevenlabs(to_speak)
 
             final_msg = stream.get_final_message()
 
@@ -933,7 +936,7 @@ def chat_and_speak(messages: List[Dict[str, str]]) -> str:
                     f"content_types={[getattr(b,'type','?') for b in final_msg.content]}")
 
         # Speak any trailing text after stream closes
-        if sentence_buffer.strip():
+        if speak and sentence_buffer.strip():
             _tts_elevenlabs(sentence_buffer.strip())
         print()
 
@@ -971,6 +974,59 @@ def chat_and_speak(messages: List[Dict[str, str]]) -> str:
 # -----------------------------
 # Main loop
 # -----------------------------
+_HALLUCINATIONS = {
+    "thanks for watching", "thank you for watching",
+    "please subscribe", "like and subscribe",
+    "you", "thank you", "thanks", "bye", "bye bye",
+    "subtitles by", "translated by",
+}
+
+
+def _process_input(text: str, messages: List[Dict[str, str]],
+                   lock: threading.Lock, speak: bool = True) -> None:
+    """Handle one user turn — shared by voice and keyboard paths."""
+    with lock:
+        print(f"\nYou: {text}")
+        messages.append({"role": "user", "content": text})
+        print("Assistant: ", end="", flush=True)
+        try:
+            reply = chat_and_speak(messages, speak=speak)
+        except Exception as e:
+            logger.error(f"Claude error: {e}")
+            reply = "I ran into an error contacting Claude."
+            print(reply)
+            if speak:
+                _tts_elevenlabs(reply)
+        messages.append({"role": "assistant", "content": reply})
+        save_history(messages)
+
+
+def _keyboard_input_loop(messages: List[Dict[str, str]], lock: threading.Lock,
+                         state: dict) -> None:
+    """Read lines from stdin and process them as text input."""
+    while True:
+        try:
+            text = input()
+        except EOFError:
+            break
+        text = text.strip()
+        if not text:
+            continue
+        if text.lower() in ("/tts", "/tts toggle"):
+            state["tts"] = not state["tts"]
+            print(f"TTS {'enabled' if state['tts'] else 'disabled'}.")
+            continue
+        if text.lower() == "/tts on":
+            state["tts"] = True
+            print("TTS enabled.")
+            continue
+        if text.lower() == "/tts off":
+            state["tts"] = False
+            print("TTS disabled.")
+            continue
+        _process_input(text, messages, lock, speak=state["tts"])
+
+
 def main() -> None:
     try:
         if config.input_device is not None or config.output_device is not None:
@@ -979,12 +1035,21 @@ def main() -> None:
 
         messages: List[Dict[str, str]] = load_history()
         rec = Recorder()
+        lock = threading.Lock()
+        state = {"tts": config.tts_enabled}
 
         if messages:
             print(f"Resuming — {len(messages) // 2} previous exchanges loaded.")
         else:
             print("Assistant ready.")
-        print(f"Hold [{config.hotkey}] to talk; release to transcribe & respond. Ctrl+C to quit.\n")
+        print(f"Hold [{config.hotkey}] to talk; release to transcribe & respond.")
+        print("Or just type and press Enter. Type /tts to toggle speech on/off. Ctrl+C to quit.\n")
+
+        # Keyboard text input thread
+        kb_thread = threading.Thread(
+            target=_keyboard_input_loop, args=(messages, lock, state), daemon=True
+        )
+        kb_thread.start()
 
         recording_flag = {"active": False}
 
@@ -992,7 +1057,7 @@ def main() -> None:
             try:
                 if key == keyboard.Key.shift_r and not recording_flag["active"]:
                     recording_flag["active"] = True
-                    print("Recording… (hold Right Shift)")
+                    print("\nRecording… (hold Right Shift)")
                     rec.start()
             except AttributeError:
                 pass
@@ -1030,32 +1095,12 @@ def main() -> None:
                         print("No speech detected.")
                         return
 
-                    # Reject common Whisper hallucinations produced for silence/music
-                    _HALLUCINATIONS = {
-                        "thanks for watching", "thank you for watching",
-                        "please subscribe", "like and subscribe",
-                        "you", "thank you", "thanks", "bye", "bye bye",
-                        "subtitles by", "translated by",
-                    }
                     if text.strip().lower().rstrip(".!?,") in _HALLUCINATIONS:
                         print(f"Hallucination filtered: {text!r}")
                         logger.info(f"Whisper hallucination filtered: {text!r} (rms={rms:.4f})")
                         return
 
-                    print(f"You: {text}")
-                    messages.append({"role": "user", "content": text})
-
-                    print("Assistant: ", end="", flush=True)
-                    try:
-                        reply = chat_and_speak(messages)
-                    except Exception as e:
-                        logger.error(f"Claude error: {e}")
-                        reply = "I ran into an error contacting Claude."
-                        print(reply)
-                        _tts_elevenlabs(reply)
-
-                    messages.append({"role": "assistant", "content": reply})
-                    save_history(messages)
+                    _process_input(text, messages, lock, speak=state["tts"])
             except AttributeError:
                 pass
             except Exception as e:
