@@ -5,6 +5,7 @@ Push-to-talk (Right Shift) → faster-whisper STT → Claude API (streaming)
 → ElevenLabs TTS sentence-by-sentence for low-latency spoken responses.
 """
 
+import collections
 import json
 import logging
 import os
@@ -61,6 +62,12 @@ class AssistantConfig:
     elevenlabs_voice_id: str = ""
     elevenlabs_model_id: str = "eleven_turbo_v2"
     tts_enabled: bool = True
+    ptt_enabled: bool = True
+    vad_start_threshold: float = 0.02   # RMS to trigger speech start
+    vad_stop_threshold: float = 0.008   # RMS to trigger speech end
+    vad_start_frames: int = 2           # consecutive loud frames to start (×100ms)
+    vad_stop_frames: int = 15           # consecutive quiet frames to stop (×100ms = 1.5s)
+    debug: bool = False
     web_search_enabled: bool = True
     web_search_max_uses: int = 5
     local_tools_enabled: bool = True
@@ -972,7 +979,7 @@ def chat_and_speak(messages: List[Dict[str, str]], speak: bool = True) -> str:
 
 
 # -----------------------------
-# Main loop
+# Shared voice audio processing
 # -----------------------------
 _HALLUCINATIONS = {
     "thanks for watching", "thank you for watching",
@@ -980,6 +987,128 @@ _HALLUCINATIONS = {
     "you", "thank you", "thanks", "bye", "bye bye",
     "subtitles by", "translated by",
 }
+
+
+def _process_voice_audio(audio: np.ndarray, messages: List[Dict[str, str]],
+                         lock: threading.Lock, state: dict) -> None:
+    """Validate and dispatch a voice recording — shared by PTT and VAD paths."""
+    duration = len(audio) / config.sample_rate
+    rms = float(np.sqrt(np.mean(audio ** 2)))
+    if duration < 0.5:
+        return
+    if rms < 0.02:
+        return
+    try:
+        text = transcribe_ndarray(audio)
+    except Exception as e:
+        print(f"Transcription error: {e}")
+        return
+    if not text:
+        return
+    if text.strip().lower().rstrip(".!?,") in _HALLUCINATIONS:
+        logger.info(f"Whisper hallucination filtered: {text!r} (rms={rms:.4f})")
+        return
+    _process_input(text, messages, lock, speak=state["tts"])
+
+
+def _always_listening_loop(messages: List[Dict[str, str]],
+                            lock: threading.Lock, state: dict) -> None:
+    """VAD-based continuous listening — runs when PTT is disabled."""
+    import time
+    FRAME_SAMPLES = int(config.sample_rate * 0.1)   # 100 ms frames
+    PRE_ROLL = 4
+
+    print("Calibrating ambient noise… (be quiet for 1 second)")
+
+    with sd.InputStream(
+        samplerate=config.sample_rate,
+        channels=config.channels,
+        dtype="float32",
+        device=config.input_device,
+        blocksize=FRAME_SAMPLES,
+    ) as stream:
+        # Actively drain PipeWire garbage frames — wait until signal stabilizes
+        # (PipeWire emits frames with RMS ~1.0 for ~1 second on stream open)
+        stable_streak = 0
+        for _ in range(50):  # max 5 second drain timeout
+            data, _ = stream.read(FRAME_SAMPLES)
+            rms = float(np.sqrt(np.mean(data ** 2)))
+            if np.isfinite(rms) and rms < 0.3:
+                stable_streak += 1
+                if stable_streak >= 5:
+                    break
+            else:
+                stable_streak = 0
+
+        # Measure noise floor over 2 seconds of stable signal
+        noise_samples = []
+        for _ in range(20):
+            data, _ = stream.read(FRAME_SAMPLES)
+            rms = float(np.sqrt(np.mean(data ** 2)))
+            if np.isfinite(rms) and rms < 1.0:
+                noise_samples.append(rms)
+
+        noise_floor = float(np.mean(noise_samples)) if noise_samples else 0.02
+        # 2× above noise floor; cap at 0.15 so music during calibration doesn't make
+        # the threshold unreachable; honour any explicit override in config
+        start_thresh = max(noise_floor * 2.0, config.vad_start_threshold)
+        start_thresh = min(start_thresh, 0.15)
+        stop_thresh  = max(noise_floor * 1.2, config.vad_stop_threshold)
+        logger.info(f"VAD noise_floor={noise_floor:.4f} start={start_thresh:.4f} stop={stop_thresh:.4f}")
+        if config.debug:
+            print(f"Noise floor={noise_floor:.4f}  start>{start_thresh:.4f}  stop<{stop_thresh:.4f}")
+        print("Always-listening mode active. Speak anytime.")
+
+        pre_roll: collections.deque = collections.deque(maxlen=PRE_ROLL)
+        accumulated: List[np.ndarray] = []
+        speech_frames = 0
+        silence_frames = 0
+        recording = False
+        frame_count = 0
+
+        while not state["ptt"]:
+            data, _ = stream.read(FRAME_SAMPLES)
+            rms = float(np.sqrt(np.mean(data ** 2)))
+            if not np.isfinite(rms):
+                continue
+
+            frame_count += 1
+            if config.debug and frame_count % 10 == 0:
+                bar = "█" * min(int(rms / max(start_thresh, 0.001) * 20), 30)
+                status = "REC" if recording else "   "
+                print(f"\r[VAD {status}] {rms:.4f}  {bar:<30}", end="", flush=True)
+
+            if not recording:
+                pre_roll.append(data.copy())
+                if rms > start_thresh:
+                    speech_frames += 1
+                    if speech_frames >= config.vad_start_frames:
+                        recording = True
+                        speech_frames = 0
+                        silence_frames = 0
+                        accumulated = [d.copy() for d in pre_roll]
+                        print(f"\n[recording… RMS={rms:.4f}]", flush=True)
+                else:
+                    speech_frames = max(0, speech_frames - 1)
+            else:
+                accumulated.append(data.copy())
+                if rms < stop_thresh:
+                    silence_frames += 1
+                    if silence_frames >= config.vad_stop_frames:
+                        recording = False
+                        silence_frames = 0
+                        audio = np.concatenate(accumulated)
+                        accumulated = []
+                        print()
+                        threading.Thread(
+                            target=_process_voice_audio,
+                            args=(audio, messages, lock, state),
+                            daemon=True,
+                        ).start()
+                else:
+                    silence_frames = 0
+
+    print("Always-listening mode stopped.")
 
 
 def _process_input(text: str, messages: List[Dict[str, str]],
@@ -1001,6 +1130,13 @@ def _process_input(text: str, messages: List[Dict[str, str]],
         save_history(messages)
 
 
+def _start_always_listening(messages: List[Dict[str, str]],
+                            lock: threading.Lock, state: dict) -> None:
+    threading.Thread(
+        target=_always_listening_loop, args=(messages, lock, state), daemon=True
+    ).start()
+
+
 def _keyboard_input_loop(messages: List[Dict[str, str]], lock: threading.Lock,
                          state: dict) -> None:
     """Read lines from stdin and process them as text input."""
@@ -1012,6 +1148,10 @@ def _keyboard_input_loop(messages: List[Dict[str, str]], lock: threading.Lock,
         text = text.strip()
         if not text:
             continue
+        if text.lower() in ("/exitai", "/exit", "/quit"):
+            print("Goodbye.")
+            state["quit"].set()
+            break
         if text.lower() in ("/tts", "/tts toggle"):
             state["tts"] = not state["tts"]
             print(f"TTS {'enabled' if state['tts'] else 'disabled'}.")
@@ -1023,6 +1163,23 @@ def _keyboard_input_loop(messages: List[Dict[str, str]], lock: threading.Lock,
         if text.lower() == "/tts off":
             state["tts"] = False
             print("TTS disabled.")
+            continue
+        if text.lower() in ("/ptt", "/ptt toggle"):
+            state["ptt"] = not state["ptt"]
+            if state["ptt"]:
+                print("Push-to-talk enabled. Hold Right Shift to speak.")
+            else:
+                print("Push-to-talk disabled.")
+                _start_always_listening(messages, lock, state)
+            continue
+        if text.lower() == "/ptt on":
+            state["ptt"] = True
+            print("Push-to-talk enabled. Hold Right Shift to speak.")
+            continue
+        if text.lower() == "/ptt off":
+            state["ptt"] = False
+            print("Push-to-talk disabled.")
+            _start_always_listening(messages, lock, state)
             continue
         _process_input(text, messages, lock, speak=state["tts"])
 
@@ -1036,14 +1193,16 @@ def main() -> None:
         messages: List[Dict[str, str]] = load_history()
         rec = Recorder()
         lock = threading.Lock()
-        state = {"tts": config.tts_enabled}
+        state = {"tts": config.tts_enabled, "ptt": config.ptt_enabled,
+                 "quit": threading.Event()}
 
         if messages:
             print(f"Resuming — {len(messages) // 2} previous exchanges loaded.")
         else:
             print("Assistant ready.")
         print(f"Hold [{config.hotkey}] to talk; release to transcribe & respond.")
-        print("Or just type and press Enter. Type /tts to toggle speech on/off. Ctrl+C to quit.\n")
+        print("Or just type and press Enter.")
+        print("Commands: /tts  /ptt  /exitai\n")
 
         # Keyboard text input thread
         kb_thread = threading.Thread(
@@ -1051,11 +1210,16 @@ def main() -> None:
         )
         kb_thread.start()
 
+        # Start always-listening if PTT is disabled at launch
+        if not state["ptt"]:
+            _start_always_listening(messages, lock, state)
+
         recording_flag = {"active": False}
 
         def on_press(key: keyboard.Key) -> None:
             try:
-                if key == keyboard.Key.shift_r and not recording_flag["active"]:
+                if (key == keyboard.Key.shift_r and not recording_flag["active"]
+                        and state["ptt"]):
                     recording_flag["active"] = True
                     print("\nRecording… (hold Right Shift)")
                     rec.start()
@@ -1066,7 +1230,7 @@ def main() -> None:
 
         def on_release(key: keyboard.Key) -> None:
             try:
-                if key == keyboard.Key.shift_r and recording_flag["active"]:
+                if key == keyboard.Key.shift_r and recording_flag["active"] and state["ptt"]:
                     recording_flag["active"] = False
                     print("Stopped. Transcribing…")
                     audio = rec.stop()
@@ -1075,32 +1239,7 @@ def main() -> None:
                         print("No audio captured.")
                         return
 
-                    duration = len(audio) / config.sample_rate
-                    rms = float(np.sqrt(np.mean(audio ** 2)))
-
-                    if duration < 0.5:
-                        print(f"Too short ({duration:.2f}s) — ignored.")
-                        return
-                    if rms < 0.02:
-                        print(f"Audio too quiet (RMS={rms:.4f}) — ignored.")
-                        return
-
-                    try:
-                        text = transcribe_ndarray(audio)
-                    except Exception as e:
-                        print(f"Transcription error: {e}")
-                        return
-
-                    if not text:
-                        print("No speech detected.")
-                        return
-
-                    if text.strip().lower().rstrip(".!?,") in _HALLUCINATIONS:
-                        print(f"Hallucination filtered: {text!r}")
-                        logger.info(f"Whisper hallucination filtered: {text!r} (rms={rms:.4f})")
-                        return
-
-                    _process_input(text, messages, lock, speak=state["tts"])
+                    _process_voice_audio(audio, messages, lock, state)
             except AttributeError:
                 pass
             except Exception as e:
@@ -1108,9 +1247,12 @@ def main() -> None:
 
         with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
             try:
-                listener.join()
+                state["quit"].wait()
             except KeyboardInterrupt:
                 print("\nExiting…")
+            finally:
+                save_history(messages)
+                listener.stop()
 
     except Exception as e:
         logger.critical(f"Fatal error: {e}", exc_info=True)
