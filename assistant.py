@@ -1010,6 +1010,16 @@ def main() -> None:
                         print("No audio captured.")
                         return
 
+                    duration = len(audio) / config.sample_rate
+                    rms = float(np.sqrt(np.mean(audio ** 2)))
+
+                    if duration < 0.5:
+                        print(f"Too short ({duration:.2f}s) — ignored.")
+                        return
+                    if rms < 0.02:
+                        print(f"Audio too quiet (RMS={rms:.4f}) — ignored.")
+                        return
+
                     try:
                         text = transcribe_ndarray(audio)
                     except Exception as e:
@@ -1018,6 +1028,18 @@ def main() -> None:
 
                     if not text:
                         print("No speech detected.")
+                        return
+
+                    # Reject common Whisper hallucinations produced for silence/music
+                    _HALLUCINATIONS = {
+                        "thanks for watching", "thank you for watching",
+                        "please subscribe", "like and subscribe",
+                        "you", "thank you", "thanks", "bye", "bye bye",
+                        "subtitles by", "translated by",
+                    }
+                    if text.strip().lower().rstrip(".!?,") in _HALLUCINATIONS:
+                        print(f"Hallucination filtered: {text!r}")
+                        logger.info(f"Whisper hallucination filtered: {text!r} (rms={rms:.4f})")
                         return
 
                     print(f"You: {text}")
