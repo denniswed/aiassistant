@@ -1210,6 +1210,13 @@ def main() -> None:
         )
         kb_thread.start()
 
+        # Startup greeting — one-off Claude call, not added to conversation history
+        def _greet() -> None:
+            with lock:
+                greeting_msgs = [{"role": "user", "content": "Greet me briefly — one or two sentences max."}]
+                chat_and_speak(greeting_msgs, speak=state["tts"])
+        threading.Thread(target=_greet, daemon=True).start()
+
         # Start always-listening if PTT is disabled at launch
         if not state["ptt"]:
             _start_always_listening(messages, lock, state)
