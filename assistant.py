@@ -57,7 +57,7 @@ class AssistantConfig:
     whisper_compute_type: str = "int8"
     hotkey: str = "shift_r"
     temperature: float = 0.7
-    max_tokens: int = 1000
+    max_tokens: int = 16000
     claude_model: str = "claude-opus-4-8"
     elevenlabs_voice_id: str = ""
     elevenlabs_model_id: str = "eleven_turbo_v2"
@@ -946,6 +946,23 @@ def chat_and_speak(messages: List[Dict[str, str]], speak: bool = True) -> str:
         if speak and sentence_buffer.strip():
             _tts_elevenlabs(sentence_buffer.strip())
         print()
+
+        # Hit the token ceiling mid-response — auto-continue instead of
+        # making the user type "continue". Feed the partial assistant turn
+        # back and prompt Claude to resume exactly where it left off.
+        if final_msg.stop_reason == "max_tokens":
+            logger.info("Hit max_tokens — auto-continuing response")
+            working_messages.append({
+                "role": "assistant",
+                "content": _blocks_to_params(final_msg.content),
+            })
+            working_messages.append({
+                "role": "user",
+                "content": "Continue exactly where you left off. Do not repeat "
+                           "anything you already wrote and add no preamble — "
+                           "just resume, mid-sentence if needed.",
+            })
+            continue
 
         # Done — no client-side tool calls pending
         if final_msg.stop_reason != "tool_use":
