@@ -14,6 +14,15 @@ if [ ! -d "$VENV" ]; then
     exit 1
 fi
 
+for var in ANTHROPIC_API_KEY ELEVENLABS_API_KEY; do
+    if [ -z "${!var:-}" ]; then
+        echo "Error: $var is not set."
+        echo "Add it to ~/.config/environment.d/ai-assistant.conf and log out/in."
+        read -r -p "Press Enter to close…"
+        exit 1
+    fi
+done
+
 source "$VENV/bin/activate"
 cd "$ASSISTANT_DIR"
 exec python assistant.py
