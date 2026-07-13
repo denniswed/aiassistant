@@ -1,3 +1,8 @@
+# RAG knowledge base — vector store + source documents (may be large / copyrighted)
+kb_store/
+knowledge/*
+!knowledge/.gitkeep
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

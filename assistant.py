@@ -72,6 +72,8 @@ class AssistantConfig:
     web_search_max_uses: int = 5
     local_tools_enabled: bool = True
     spotify_enabled: bool = True
+    kb_enabled: bool = True
+    kb_top_k: int = 4
     system_prompt_file: str = ""
 
     def __post_init__(self) -> None:
@@ -458,6 +460,8 @@ def _execute_tool(name: str, inputs: dict) -> str:
             return _tool_spotify_now_playing()
         if name == "spotify_queue":
             return _tool_spotify_queue(inputs["query"])
+        if name == "search_knowledge_base":
+            return _tool_search_knowledge_base(inputs["query"])
         return f"Unknown tool: {name}"
     except Exception as e:
         return f"Error in {name}: {e}"
@@ -538,6 +542,7 @@ _TOOL_ANNOUNCEMENTS = {
     "spotify_control":     "",   # instant — no need to announce
     "spotify_now_playing": "",
     "spotify_queue":       "Adding that to the queue.",
+    "search_knowledge_base": "Let me check your library.",
 }
 
 
@@ -834,6 +839,59 @@ SPOTIFY_TOOLS = [
 ]
 
 
+# -----------------------------
+# Knowledge base (local RAG) tool
+# -----------------------------
+def _tool_search_knowledge_base(query: str) -> str:
+    """Retrieve relevant passages from the local RAG store, with source attribution."""
+    try:
+        import rag
+    except ImportError as e:
+        return f"Knowledge base unavailable (missing dependency: {e})."
+    try:
+        hits = rag.search(query, top_k=config.kb_top_k)
+    except Exception as e:
+        logger.error(f"KB search failed: {e}")
+        return f"Knowledge base search failed: {e}"
+
+    if not hits:
+        return ("No relevant passages found in the knowledge base "
+                "(it may be empty — run `python ingest.py`).")
+
+    blocks = []
+    for h in hits:
+        page = f", p.{h['page']}" if h.get("page", -1) and h["page"] > 0 else ""
+        citation = f"{h['title']}{page} [{h['source']}]"
+        blocks.append(f"[{h['rank']}] (relevance {h['score']:.2f}) {citation}\n{h['text']}")
+    header = ("Relevant passages from the knowledge base. Cite the source shown in "
+              "brackets when you use one:\n\n")
+    return header + "\n\n---\n\n".join(blocks)
+
+
+KB_TOOLS = [
+    {
+        "name": "search_knowledge_base",
+        "description": (
+            "Search the user's personal library of ingested books and papers "
+            "(local RAG store) for passages relevant to a question. Returns the "
+            "most relevant excerpts WITH their source (title, page, filename) so "
+            "you can cite the primary source. Use this whenever the user asks "
+            "about a topic their books/papers likely cover, or asks what a source says."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The topic or question to search the library for."
+                }
+            },
+            "required": ["query"]
+        }
+    }
+]
+
+
 def _blocks_to_params(content_blocks: list) -> list:
     """Convert SDK content block objects to plain dicts for the next API call."""
     result = []
@@ -879,6 +937,8 @@ def chat_and_speak(messages: List[Dict[str, str]], speak: bool = True) -> str:
         tools.extend(LOCAL_TOOLS)
     if config.spotify_enabled:
         tools.extend(SPOTIFY_TOOLS)
+    if config.kb_enabled:
+        tools.extend(KB_TOOLS)
 
     working_messages = list(messages)
     logger.info(f"Tools offered: {[t.get('name', t.get('type')) for t in tools]}")

@@ -15,5 +15,13 @@
   "web_search_enabled": true,
   "web_search_max_uses": 5,
   "local_tools_enabled": true,
-  "spotify_enabled": true
+  "spotify_enabled": true,
+  "kb_enabled": true,
+  "kb_top_k": 4,
+  "kb_dir": "~/source/aiassistant/knowledge",
+  "kb_store_dir": "~/source/aiassistant/kb_store",
+  "kb_collection": "knowledge",
+  "kb_embedding_model": "BAAI/bge-base-en-v1.5",
+  "kb_chunk_tokens": 400,
+  "kb_chunk_overlap": 60
 }
