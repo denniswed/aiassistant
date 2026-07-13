@@ -111,6 +111,12 @@ def _extract_pdf(path: Path) -> Tuple[str, List[Tuple[int, str]]]:
             title = reader.metadata.title.strip()
     except Exception:
         pass
+    # arXiv/LaTeX PDFs often carry a figure filename or the arXiv id as the "title".
+    # Reject those and fall back to the (descriptive) filename stem.
+    low = title.lower()
+    if (not title or len(title) < 4 or low.startswith("arxiv:")
+            or low.endswith((".eps", ".ps", ".dvi", ".tex", ".pdf", ".fig"))):
+        title = ""
     pages = []
     for i, page in enumerate(reader.pages, start=1):
         try:
