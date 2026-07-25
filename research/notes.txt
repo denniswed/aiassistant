@@ -1,0 +1,45 @@
+Let me actually pull the arXiv abstract pages so you have direct links:
+continue
+
+You: continue
+Assistant: Let me grab the direct arXiv links so you have clickable primary sources.Here are your direct, clickable primary sources — verified links:
+
+## 🎯 Timescape (your idea, made rigorous — Wiltshire)
+
+1. **"Cosmic clocks, cosmic variance and cosmic averages"** (2007) — the foundational timescape paper
+   → **https://arxiv.org/abs/gr-qc/0702082**
+   *This is the one to start with. It's literally your "clocks run differently in voids vs. wells, and ignoring it fakes acceleration" argument, derived properly.*
+
+2. **"Average observational quantities in the timescape cosmology"** (2009) — the testable-predictions paper
+   → **https://arxiv.org/abs/0909.0749**
+
+3. **Timescape vs. Pantheon+ supernovae** (2024, Lane, Seifert, Ridden-Harper, Wiltshire) — the recent empirical shot that made news
+   → search arXiv listing: **https://arxiv.org/a/wiltshire_d_1** (his author page — newest papers at top, grab the 2024 Pantheon+ one)
+
+## ⚙ Backreaction (the technical engine — Buchert)
+
+4. **"On average properties of inhomogeneous fluids in general relativity: dust cosmologies"** (2000) — *the* foundational backreaction paper, derives the Buchert equations
+   → **https://arxiv.org/abs/gr-qc/9906015**
+
+5. **"Dark energy from structure: a status report"** (Buchert, 2008) — readable framing of "structure mimics dark energy"
+   → **https://arxiv.org/abs/0707.2153**
+
+## ⚖ The skeptics (stay calibrated — read the opposition)
+
+6. **Green & Wald, "How well is our universe described by an FLRW model?"** — the rigorous "backreaction is negligible" counterargument
+   → **https://arxiv.org/abs/1407.8084**
+
+---
+
+## How I'd read these, given how your brain works
+
+1. **Start with gr-qc/0702082 (Wiltshire 2007)** — read the intro and conceptual sections. You'll have the eerie experience of reading your own argument in someone else's equations. That's the payoff.
+2. **Then the 2024 Pantheon+ paper** — to see whether the data actually backs it *right now*.
+3. **Then Green & Wald (1407.8084)** — to feel the strongest punch *against* the idea. If you can hold both, you understand the real state of the debate better than most people who have opinions about dark energy.
+
+
+- **Wiltshire, gr-qc/0702082** — your dark energy instinct, made rigorous (timescape)
+- **Buchert, gr-qc/9906015** — the math engine (backreaction)
+- **Green & Wald, 1407.8084** — the strongest counter, to stay honest
+- **Carroll, *Something Deeply Hidden*** — the antidote to quantum hand-waving
+- **Albert, *Quantum Mechanics and Experience*** — the measurement problem, surgically

@@ -23,6 +23,7 @@ for var in ANTHROPIC_API_KEY ELEVENLABS_API_KEY; do
     fi
 done
 
-source "$VENV/bin/activate"
+
 cd "$ASSISTANT_DIR"
+source setupenv.sh
 exec python assistant.py
