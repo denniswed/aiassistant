@@ -11,6 +11,7 @@ import logging
 import os
 import queue
 import re
+import select
 import subprocess
 import sys
 import tempfile
@@ -18,8 +19,18 @@ import threading
 import urllib.request
 import wave
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+try:
+    # Importing readline gives input() line editing + history, and — the reason
+    # it's here — bracketed paste, so a multi-line paste arrives as one string
+    # instead of one line per turn.
+    import readline
+    readline.parse_and_bind("set enable-bracketed-paste on")
+except Exception:  # not available (or libedit) — _read_stdin_message copes
+    readline = None
 
 import anthropic
 import numpy as np
@@ -61,7 +72,7 @@ class AssistantConfig:
     claude_model: str = "claude-opus-4-8"
     elevenlabs_voice_id: str = ""
     elevenlabs_model_id: str = "eleven_turbo_v2"
-    tts_enabled: bool = True
+    tts_enabled: bool = False   # startup default only — /tts toggles it at runtime
     ptt_enabled: bool = True
     vad_start_threshold: float = 0.02   # RMS to trigger speech start
     vad_stop_threshold: float = 0.008   # RMS to trigger speech end
@@ -75,6 +86,9 @@ class AssistantConfig:
     kb_enabled: bool = True
     kb_top_k: int = 4
     system_prompt_file: str = ""
+    llm_backend: str = "claude"  # "claude", "lmstudio", or "lmstudio_api"
+    lmstudio_model: str = ""  # Model name for LM Studio
+    lmstudio_api_url: str = "http://127.0.0.1:1234"  # API URL for LM Studio
 
     def __post_init__(self) -> None:
         if self.system_prompt_file:
@@ -123,7 +137,7 @@ config = load_config()
 HISTORY_FILE = Path(__file__).parent / "history.json"
 
 
-def load_history() -> List[Dict[str, str]]:
+def load_history() -> List[Dict[str, Any]]:
     if HISTORY_FILE.exists():
         try:
             with open(HISTORY_FILE, "r") as f:
@@ -133,7 +147,7 @@ def load_history() -> List[Dict[str, str]]:
     return []
 
 
-def save_history(messages: List[Dict[str, str]]) -> None:
+def save_history(messages: List[Dict[str, Any]]) -> None:
     try:
         with open(HISTORY_FILE, "w") as f:
             json.dump(messages, f, indent=2)
@@ -142,10 +156,93 @@ def save_history(messages: List[Dict[str, str]]) -> None:
 
 
 # -----------------------------
+# Time awareness
+# -----------------------------
+# Each persisted turn carries a local-time `ts`. It never goes to the API as a
+# key (the Messages API rejects unknown message fields) — instead user turns get
+# a `[time: …]` header prepended when the payload is assembled, so Claude can see
+# when things were said and how long the gaps were.
+
+def _now_ts() -> str:
+    """Local time, ISO 8601 with UTC offset."""
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _parse_ts(ts: Any) -> Optional[datetime]:
+    if not isinstance(ts, str):
+        return None
+    try:
+        return datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+
+
+def _humanize_gap(seconds: float) -> str:
+    def unit(n: int, name: str) -> str:
+        return f"{n} {name}" + ("" if n == 1 else "s")
+
+    s = max(0, int(seconds))
+    if s < 60:
+        return unit(s, "second")
+    if s < 3600:
+        return unit(s // 60, "minute")
+    if s < 172800:  # under 2 days, hours read better
+        return unit(s // 3600, "hour")
+    return unit(s // 86400, "day")
+
+
+def _time_header(dt: datetime, prev_dt: Optional[datetime]) -> str:
+    stamp = dt.strftime("%a %Y-%m-%d %H:%M:%S %Z").strip()
+    if prev_dt is None:
+        return f"[time: {stamp}]"
+    gap = _humanize_gap((dt - prev_dt).total_seconds())
+    return f"[time: {stamp} | {gap} since the previous message]"
+
+
+def _last_ts(messages: List[Dict[str, Any]]) -> Optional[str]:
+    """Timestamp of the most recent turn that has one, if any."""
+    for msg in reversed(messages):
+        if _parse_ts(msg.get("ts")) is not None:
+            return msg["ts"]
+    return None
+
+
+def _with_time_context(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Build an API-ready copy of the history: drop local-only keys and prefix
+    each timestamped user turn with when it was said.
+
+    A message may carry `prev_ts` to anchor its gap to a turn that isn't in this
+    payload — used by the startup greeting, which is a one-off single-message call
+    but should still know how long the user has been away.
+    """
+    payload: List[Dict[str, Any]] = []
+    prev_dt: Optional[datetime] = None
+    for msg in messages:
+        api_msg = {k: v for k, v in msg.items() if k in ("role", "content")}
+        dt = _parse_ts(msg.get("ts"))
+        anchor = _parse_ts(msg.get("prev_ts")) or prev_dt
+        if (dt is not None and api_msg.get("role") == "user"
+                and isinstance(api_msg.get("content"), str)):
+            api_msg["content"] = f"{_time_header(dt, anchor)}\n{api_msg['content']}"
+        if dt is not None:
+            prev_dt = dt
+        payload.append(api_msg)
+    return payload
+
+
+# -----------------------------
 # API clients (keys from env)
 # -----------------------------
 claude_client = anthropic.Anthropic()   # ANTHROPIC_API_KEY
 el_client = ElevenLabs()               # ELEVENLABS_API_KEY
+
+# LM Studio client for local models
+lmstudio_client = None
+try:
+    from lmstudio import LMStudio
+    lmstudio_client = LMStudio()
+except ImportError:
+    logger.warning("LM Studio SDK not available")
 
 
 # -----------------------------
@@ -921,8 +1018,8 @@ def _blocks_to_params(content_blocks: list) -> list:
 # -----------------------------
 # Claude streaming + tool loop + sentence TTS
 # -----------------------------
-def chat_and_speak(messages: List[Dict[str, str]], speak: bool = True) -> str:
-    """Stream Claude, handle tool calls, speak each sentence as it arrives."""
+def chat_and_speak(messages: List[Dict[str, Any]], speak: bool = True) -> str:
+    """Stream Claude or LM Studio, handle tool calls, speak each sentence as it arrives."""
     full_response = ""
 
     # Build tool list
@@ -940,53 +1037,35 @@ def chat_and_speak(messages: List[Dict[str, str]], speak: bool = True) -> str:
     if config.kb_enabled:
         tools.extend(KB_TOOLS)
 
-    working_messages = list(messages)
+    working_messages = _with_time_context(messages)
     logger.info(f"Tools offered: {[t.get('name', t.get('type')) for t in tools]}")
 
     while True:
         sentence_buffer = ""
         search_announced = False
 
-        stream_kwargs: dict = dict(
-            model=config.claude_model,
-            max_tokens=config.max_tokens,
-            system=config.system_prompt,
-            messages=working_messages,
-        )
-        if tools:
-            stream_kwargs["tools"] = tools
+        # Use appropriate backend
+        if config.llm_backend == "lmstudio":
+            stream_kwargs: dict = dict(
+                model=config.lmstudio_model,
+                max_tokens=config.max_tokens,
+                system=config.system_prompt,
+                messages=working_messages,
+                stream=True,
+            )
+            if tools:
+                stream_kwargs["tools"] = tools
 
-        with claude_client.messages.stream(**stream_kwargs) as stream:
-            for event in stream:
-                btype = ""
-                if event.type == "content_block_start":
-                    btype = getattr(event.content_block, "type", "")
-
-                # Web search (server-side) — announce and wait
-                if (event.type == "content_block_start" and
-                        btype == "server_tool_use" and
-                        getattr(event.content_block, "name", "") == "web_search"):
-                    if not search_announced:
-                        search_announced = True
-                        print("\n[searching…] ", end="", flush=True)
-                        if speak:
-                            _tts_elevenlabs("Let me look that up.")
-
-                # Local tool call starting — announce what we're doing
-                elif event.type == "content_block_start" and btype == "tool_use":
-                    name = getattr(event.content_block, "name", "tool")
-                    announcement = _TOOL_ANNOUNCEMENTS.get(name, f"Using {name}.")
-                    print(f"\n[{name}…] ", end="", flush=True)
-                    if speak and announcement:
-                        _tts_elevenlabs(announcement)
-
-                # Text chunk — speak sentence by sentence
-                elif (event.type == "content_block_delta" and
-                      getattr(event.delta, "type", "") == "text_delta"):
-                    chunk = event.delta.text
-                    print(chunk, end="", flush=True)
-                    sentence_buffer += chunk
-                    full_response += chunk
+            # Use LM Studio client
+            response = lmstudio_client.chat.completions.create(**stream_kwargs)
+            
+            # Process streaming response from LM Studio
+            for chunk in response:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    chunk_text = chunk.choices[0].delta.content
+                    print(chunk_text, end="", flush=True)
+                    sentence_buffer += chunk_text
+                    full_response += chunk_text
 
                     while True:
                         match = _SENTENCE_END.search(sentence_buffer)
@@ -997,7 +1076,126 @@ def chat_and_speak(messages: List[Dict[str, str]], speak: bool = True) -> str:
                         if speak:
                             _tts_elevenlabs(to_speak)
 
-            final_msg = stream.get_final_message()
+            # For LM Studio, we don't have the same final_msg handling as Claude
+            # so we'll just break from the loop after processing the response
+            logger.info("LM Studio response completed")
+            break
+        elif config.llm_backend == "lmstudio_api":
+            # Use LM Studio HTTP API
+            import requests
+            
+            stream_kwargs = {
+                "model": config.lmstudio_model,
+                "messages": working_messages,
+                "stream": True,
+                "max_tokens": config.max_tokens,
+            }
+            
+            if tools:
+                stream_kwargs["tools"] = tools
+                
+            # Add system prompt to messages
+            if config.system_prompt:
+                stream_kwargs["system"] = config.system_prompt
+
+            try:
+                response = requests.post(
+                    f"{config.lmstudio_api_url}/v1/chat/completions",
+                    json=stream_kwargs,
+                    stream=True,
+                    timeout=300  # 5 minute timeout
+                )
+                response.raise_for_status()
+                
+                # Process streaming response from LM Studio API
+                for line in response.iter_lines():
+                    if line:
+                        line = line.decode('utf-8')
+                        if line.startswith('data: '):
+                            data = line[6:]  # Remove 'data: ' prefix
+                            if data == '[DONE]':
+                                break
+                            
+                            try:
+                                chunk = json.loads(data)
+                                if 'choices' in chunk and len(chunk['choices']) > 0:
+                                    delta = chunk['choices'][0].get('delta', {})
+                                    if 'content' in delta:
+                                        chunk_text = delta['content']
+                                        print(chunk_text, end="", flush=True)
+                                        sentence_buffer += chunk_text
+                                        full_response += chunk_text
+
+                                        while True:
+                                            match = _SENTENCE_END.search(sentence_buffer)
+                                            if not match:
+                                                break
+                                            to_speak = sentence_buffer[:match.end()].strip()
+                                            sentence_buffer = sentence_buffer[match.end():]
+                                            if speak:
+                                                _tts_elevenlabs(to_speak)
+                            except json.JSONDecodeError:
+                                continue  # Skip malformed JSON lines
+
+                logger.info("LM Studio API response completed")
+                break
+            except Exception as e:
+                logger.error(f"Error calling LM Studio API: {e}")
+                raise
+            
+        else:
+            # Default Claude behavior
+            stream_kwargs: dict = dict(
+                model=config.claude_model,
+                max_tokens=config.max_tokens,
+                system=config.system_prompt,
+                messages=working_messages,
+            )
+            if tools:
+                stream_kwargs["tools"] = tools
+
+            with claude_client.messages.stream(**stream_kwargs) as stream:
+                for event in stream:
+                    btype = ""
+                    if event.type == "content_block_start":
+                        btype = getattr(event.content_block, "type", "")
+
+                    # Web search (server-side) — announce and wait
+                    if (event.type == "content_block_start" and
+                            btype == "server_tool_use" and
+                            getattr(event.content_block, "name", "") == "web_search"):
+                        if not search_announced:
+                            search_announced = True
+                            print("\n[searching…] ", end="", flush=True)
+                            if speak:
+                                _tts_elevenlabs("Let me look that up.")
+
+                    # Local tool call starting — announce what we're doing
+                    elif event.type == "content_block_start" and btype == "tool_use":
+                        name = getattr(event.content_block, "name", "tool")
+                        announcement = _TOOL_ANNOUNCEMENTS.get(name, f"Using {name}.")
+                        print(f"\n[{name}…] ", end="", flush=True)
+                        if speak and announcement:
+                            _tts_elevenlabs(announcement)
+
+                    # Text chunk — speak sentence by sentence
+                    elif (event.type == "content_block_delta" and
+                          getattr(event.delta, "type", "") == "text_delta"):
+                        chunk = event.delta.text
+                        print(chunk, end="", flush=True)
+                        sentence_buffer += chunk
+                        full_response += chunk
+
+                        while True:
+                            match = _SENTENCE_END.search(sentence_buffer)
+                            if not match:
+                                break
+                            to_speak = sentence_buffer[:match.end()].strip()
+                            sentence_buffer = sentence_buffer[match.end():]
+                            if speak:
+                                _tts_elevenlabs(to_speak)
+
+                final_msg = stream.get_final_message()
 
         logger.info(f"Claude stop_reason={final_msg.stop_reason!r} "
                     f"content_types={[getattr(b,'type','?') for b in final_msg.content]}")
@@ -1066,7 +1264,7 @@ _HALLUCINATIONS = {
 }
 
 
-def _process_voice_audio(audio: np.ndarray, messages: List[Dict[str, str]],
+def _process_voice_audio(audio: np.ndarray, messages: List[Dict[str, Any]],
                          lock: threading.Lock, state: dict) -> None:
     """Validate and dispatch a voice recording — shared by PTT and VAD paths."""
     duration = len(audio) / config.sample_rate
@@ -1088,7 +1286,7 @@ def _process_voice_audio(audio: np.ndarray, messages: List[Dict[str, str]],
     _process_input(text, messages, lock, speak=state["tts"])
 
 
-def _always_listening_loop(messages: List[Dict[str, str]],
+def _always_listening_loop(messages: List[Dict[str, Any]],
                             lock: threading.Lock, state: dict) -> None:
     """VAD-based continuous listening — runs when PTT is disabled."""
     import time
@@ -1188,12 +1386,20 @@ def _always_listening_loop(messages: List[Dict[str, str]],
     print("Always-listening mode stopped.")
 
 
-def _process_input(text: str, messages: List[Dict[str, str]],
+def _echo_preview(text: str, limit: int = 400) -> str:
+    """Shorten long (usually pasted) input for the console echo."""
+    if len(text) <= limit:
+        return text
+    return (f"{text[:limit].rstrip()}…\n"
+            f"[{text.count(chr(10)) + 1} lines, {len(text)} chars]")
+
+
+def _process_input(text: str, messages: List[Dict[str, Any]],
                    lock: threading.Lock, speak: bool = True) -> None:
     """Handle one user turn — shared by voice and keyboard paths."""
     with lock:
-        print(f"\nYou: {text}")
-        messages.append({"role": "user", "content": text})
+        print(f"\nYou: {_echo_preview(text)}")
+        messages.append({"role": "user", "content": text, "ts": _now_ts()})
         print("Assistant: ", end="", flush=True)
         try:
             reply = chat_and_speak(messages, speak=speak)
@@ -1203,23 +1409,50 @@ def _process_input(text: str, messages: List[Dict[str, str]],
             print(reply)
             if speak:
                 _tts_elevenlabs(reply)
-        messages.append({"role": "assistant", "content": reply})
+        messages.append({"role": "assistant", "content": reply, "ts": _now_ts()})
         save_history(messages)
 
 
-def _start_always_listening(messages: List[Dict[str, str]],
+def _start_always_listening(messages: List[Dict[str, Any]],
                             lock: threading.Lock, state: dict) -> None:
     threading.Thread(
         target=_always_listening_loop, args=(messages, lock, state), daemon=True
     ).start()
 
 
-def _keyboard_input_loop(messages: List[Dict[str, str]], lock: threading.Lock,
+# Fallback for pastes readline's bracketed-paste didn't capture (e.g. pasted
+# while the assistant was mid-reply, or a terminal without the feature): the tty
+# delivers them as a burst of separate lines. Any line already waiting this soon
+# after the previous one is treated as part of the same paste and joined into a
+# single message instead of a turn per line.
+_PASTE_IDLE_SECS = 0.08
+_BRACKETED_PASTE_RE = re.compile(r"\x1b\[20[01]~")
+
+
+def _read_stdin_message() -> str:
+    """Read one user message from stdin, coalescing pasted multi-line input.
+
+    Blocks on the first line, then keeps reading while more input is already
+    queued on the terminal. Raises EOFError when stdin closes.
+    """
+    lines = [input()]
+    if sys.stdin.isatty():
+        # readline() reads a byte at a time, so anything still pending is in the
+        # tty buffer where select() can see it — no hidden Python-level buffering.
+        while select.select([sys.stdin], [], [], _PASTE_IDLE_SECS)[0]:
+            try:
+                lines.append(input())
+            except EOFError:
+                break
+    return _BRACKETED_PASTE_RE.sub("", "\n".join(lines))
+
+
+def _keyboard_input_loop(messages: List[Dict[str, Any]], lock: threading.Lock,
                          state: dict) -> None:
     """Read lines from stdin and process them as text input."""
     while True:
         try:
-            text = input()
+            text = _read_stdin_message()
         except EOFError:
             break
         text = text.strip()
@@ -1267,7 +1500,7 @@ def main() -> None:
             sd.default.device = (config.input_device, config.output_device)
             logger.info(f"Audio devices — input: {config.input_device}, output: {config.output_device}")
 
-        messages: List[Dict[str, str]] = load_history()
+        messages: List[Dict[str, Any]] = load_history()
         rec = Recorder()
         lock = threading.Lock()
         state = {"tts": config.tts_enabled, "ptt": config.ptt_enabled,
@@ -1279,6 +1512,8 @@ def main() -> None:
             print("Assistant ready.")
         print(f"Hold [{config.hotkey}] to talk; release to transcribe & respond.")
         print("Or just type and press Enter.")
+        print(f"TTS: {'on' if state['tts'] else 'off'}  |  "
+              f"PTT: {'on' if state['ptt'] else 'off (always listening)'}")
         print("Commands: /tts  /ptt  /exitai\n")
 
         # Keyboard text input thread
@@ -1290,7 +1525,12 @@ def main() -> None:
         # Startup greeting — one-off Claude call, not added to conversation history
         def _greet() -> None:
             with lock:
-                greeting_msgs = [{"role": "user", "content": "Greet me briefly — one or two sentences max."}]
+                greeting_msgs = [{
+                    "role": "user",
+                    "content": "Greet me briefly — one or two sentences max.",
+                    "ts": _now_ts(),
+                    "prev_ts": _last_ts(messages),   # gap since the last conversation
+                }]
                 chat_and_speak(greeting_msgs, speak=state["tts"])
         threading.Thread(target=_greet, daemon=True).start()
 

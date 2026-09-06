@@ -62,9 +62,14 @@ def main() -> None:
     print(f"Exchanges to summarize : {len(to_summarize) // 2}")
     print(f"Exchanges to keep full : {len(to_keep) // 2}")
 
-    # Format exchanges for Claude
+    # Format exchanges for Claude — include each turn's timestamp when we have one
+    # so the summary can say *when* things happened
+    def _label(m: dict) -> str:
+        ts = m.get("ts")
+        return f"{m['role'].upper()} [{ts}]" if ts else m["role"].upper()
+
     history_text = "\n\n".join(
-        f"{m['role'].upper()}: {m['content']}"
+        f"{_label(m)}: {m['content']}"
         for m in to_summarize
     )
 

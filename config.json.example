@@ -12,6 +12,8 @@
   "claude_model": "claude-opus-4-8",
   "elevenlabs_voice_id": "YOUR_ELEVENLABS_VOICE_ID",
   "elevenlabs_model_id": "eleven_turbo_v2",
+  "tts_enabled": false,
+  "ptt_enabled": true,
   "web_search_enabled": true,
   "web_search_max_uses": 5,
   "local_tools_enabled": true,

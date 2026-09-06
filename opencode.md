@@ -1,6 +1,6 @@
-# CLAUDE.md
+# Opencode Setup Guide
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This document provides guidance for setting up and using the desktop voice assistant with opencode.
 
 ## What this is
 
@@ -11,8 +11,7 @@ Right Shift / VAD → faster-whisper STT → Claude API (streaming, tool loop)
     → ElevenLabs TTS (sentence-by-sentence for low latency) → paplay
 ```
 
-Everything lives in `assistant.py` (~1300 lines). The other Python files are one-off
-utilities and diagnostics.
+Everything lives in `assistant.py` (~1300 lines). The other Python files are one-off utilities and diagnostics.
 
 ## Environment Setup
 
@@ -99,8 +98,8 @@ Functions reference `config` directly rather than taking it as a parameter.
 4. On `stop_reason == "max_tokens"` it **auto-continues** — feeds the partial turn back
    with a "resume where you left off" prompt.
 
-`_blocks_to_params` converts SDK content-block objects back into plain dicts for the next
-API call (needed because the tool loop re-sends prior assistant turns).
+ `_blocks_to_params` converts SDK content-block objects back into plain dicts for the next
+ API call (needed because the tool loop re-sends prior assistant turns).
 
 **Three input paths converge on `_process_input`:**
 - **PTT** — `pynput` `on_press`/`on_release` on Right Shift drive a `Recorder`
