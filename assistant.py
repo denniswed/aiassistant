@@ -87,7 +87,7 @@ class AssistantConfig:
     kb_top_k: int = 4
     system_prompt_file: str = ""
     llm_backend: str = "lmstudio_api"  # "claude", "lmstudio", or "lmstudio_api"
-    lmstudio_model: str = "qwen3.8-27B"  # Model name for LM Studio
+    lmstudio_model: str = ""  # Model name for LM Studio
     lmstudio_base_url: str = "http://192.168.1.14:1234"  # API URL for LM Studio
 
     def __post_init__(self) -> None:
@@ -1100,7 +1100,7 @@ def chat_and_speak(messages: List[Dict[str, Any]], speak: bool = True) -> str:
 
             try:
                 response = requests.post(
-                    f"{config.lmstudio_base_url}/chat/completions",
+                    f"{config.lmstudio_base_url}/api/v1/chat",
                     json=stream_kwargs,
                     stream=True,
                     timeout=300  # 5 minute timeout
