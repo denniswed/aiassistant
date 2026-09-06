@@ -88,7 +88,7 @@ class AssistantConfig:
     system_prompt_file: str = ""
     llm_backend: str = "lmstudio_api"  # "claude", "lmstudio", or "lmstudio_api"
     lmstudio_model: str = "qwen3.8-27B"  # Model name for LM Studio
-    lmstudio_api_url: str = "http://192.168.1.14:1234"  # API URL for LM Studio
+    lmstudio_base_url: str = "http://192.168.1.14:1234"  # API URL for LM Studio
 
     def __post_init__(self) -> None:
         if self.system_prompt_file:
