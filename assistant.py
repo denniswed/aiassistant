@@ -1081,60 +1081,88 @@ def chat_and_speak(messages: List[Dict[str, Any]], speak: bool = True) -> str:
             logger.info("LM Studio response completed")
             break
         elif config.llm_backend == "lmstudio_api":
-            # Use LM Studio HTTP API
+            # Use LM Studio HTTP API — /api/v1/chat takes a single top-level
+            # "input" field (a string, or an array of {type:"message"/"image"}
+            # parts), not an Anthropic-style "messages" array. There is no
+            # "system" role inside it either — system_prompt is a separate
+            # top-level string. Tool calls aren't part of this schema, so
+            # tool_use/tool_result blocks are dropped rather than forwarded.
             import requests
-            
+
+            def _content_to_text(content) -> str:
+                if isinstance(content, str):
+                    return content
+                parts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        parts.append(block.get("text", ""))
+                return "".join(parts)
+
+            def _content_to_images(content) -> list:
+                images = []
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "image":
+                            source = block.get("source", {})
+                            if source.get("type") == "base64":
+                                media_type = source.get("media_type", "image/png")
+                                images.append({
+                                    "type": "image",
+                                    "data_url": f"data:{media_type};base64,{source.get('data', '')}",
+                                })
+                            elif source.get("type") == "url":
+                                images.append({"type": "image", "data_url": source.get("url", "")})
+                return images
+
+            input_items: list = []
+            system_prompt = config.system_prompt or None
+            for msg in working_messages:
+                role = msg.get("role")
+                content = msg.get("content", "")
+                if role == "system":
+                    text = _content_to_text(content)
+                    system_prompt = f"{system_prompt}\n\n{text}" if system_prompt else text
+                    continue
+                text = _content_to_text(content)
+                if text:
+                    input_items.append({"type": "message", "content": text})
+                input_items.extend(_content_to_images(content))
+
             stream_kwargs = {
                 "model": config.lmstudio_model,
-                "input": working_messages,
-                "stream": True
+                "input": input_items,
+                "stream": False,
+                "temperature": config.temperature,
+                "max_output_tokens": config.max_tokens,
             }
-            
-            if tools:
-                stream_kwargs["tools"] = tools
-                
-            # Add system prompt to messages
-            if config.system_prompt:
-                stream_kwargs["system"] = config.system_prompt
+            if system_prompt:
+                stream_kwargs["system_prompt"] = system_prompt
 
             try:
                 response = requests.post(
-                    f"{config.lmstudio_base_url}/v1/chat",
+                    f"{config.lmstudio_base_url}/api/v1/chat",
                     json=stream_kwargs,
-                    stream=True,
                     timeout=300  # 5 minute timeout
                 )
                 response.raise_for_status()
-                
-                # Process streaming response from LM Studio API
-                for line in response.iter_lines():
-                    if line:
-                        line = line.decode('utf-8')
-                        if line.startswith('data: '):
-                            data = line[6:]  # Remove 'data: ' prefix
-                            if data == '[DONE]':
-                                break
-                            
-                            try:
-                                chunk = json.loads(data)
-                                if 'choices' in chunk and len(chunk['choices']) > 0:
-                                    delta = chunk['choices'][0].get('delta', {})
-                                    if 'content' in delta:
-                                        chunk_text = delta['content']
-                                        print(chunk_text, end="", flush=True)
-                                        sentence_buffer += chunk_text
-                                        full_response += chunk_text
 
-                                        while True:
-                                            match = _SENTENCE_END.search(sentence_buffer)
-                                            if not match:
-                                                break
-                                            to_speak = sentence_buffer[:match.end()].strip()
-                                            sentence_buffer = sentence_buffer[match.end():]
-                                            if speak:
-                                                _tts_elevenlabs(to_speak)
-                            except json.JSONDecodeError:
-                                continue  # Skip malformed JSON lines
+                # Process the LM Studio API response
+                data = response.json()
+                for item in data.get("output", []):
+                    if item.get("type") == "message":
+                        chunk_text = item.get("content", "")
+                        print(chunk_text, end="", flush=True)
+                        sentence_buffer += chunk_text
+                        full_response += chunk_text
+
+                        while True:
+                            match = _SENTENCE_END.search(sentence_buffer)
+                            if not match:
+                                break
+                            to_speak = sentence_buffer[:match.end()].strip()
+                            sentence_buffer = sentence_buffer[match.end():]
+                            if speak:
+                                _tts_elevenlabs(to_speak)
 
                 logger.info("LM Studio API response completed")
                 break
