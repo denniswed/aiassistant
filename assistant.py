@@ -240,7 +240,7 @@ el_client = ElevenLabs()               # ELEVENLABS_API_KEY
 lmstudio_client = None
 try:
     from lmstudio import LMStudio
-    lmstudio_client = LMStudio()
+    lmstudio_client = LMStudio(base_url=config.lmstudio_base_url)
 except ImportError:
     logger.warning("LM Studio SDK not available")
 
@@ -1086,9 +1086,8 @@ def chat_and_speak(messages: List[Dict[str, Any]], speak: bool = True) -> str:
             
             stream_kwargs = {
                 "model": config.lmstudio_model,
-                "messages": working_messages,
-                "stream": True,
-                "max_tokens": config.max_tokens,
+                "input": working_messages,
+                "stream": True
             }
             
             if tools:
@@ -1100,7 +1099,7 @@ def chat_and_speak(messages: List[Dict[str, Any]], speak: bool = True) -> str:
 
             try:
                 response = requests.post(
-                    f"{config.lmstudio_base_url}/api/v1/chat",
+                    f"{config.lmstudio_base_url}/v1/chat",
                     json=stream_kwargs,
                     stream=True,
                     timeout=300  # 5 minute timeout
