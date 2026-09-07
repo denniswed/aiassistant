@@ -1172,6 +1172,13 @@ def chat_and_speak(messages: List[Dict[str, Any]], speak: bool = True) -> str:
                     json=stream_kwargs,
                     timeout=300  # 5 minute timeout
                 )
+                if not response.ok:
+                    # LM Studio puts the actual validation error in the body —
+                    # raise_for_status() alone discards it, leaving only the
+                    # unhelpful "400 Client Error: Bad Request for url: ...".
+                    logger.error(
+                        f"LM Studio API {response.status_code} error body: {response.text}"
+                    )
                 response.raise_for_status()
 
                 # Process the LM Studio API response
