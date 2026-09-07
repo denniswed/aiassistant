@@ -34,6 +34,7 @@ except Exception:  # not available (or libedit) — _read_stdin_message copes
 
 import anthropic
 import numpy as np
+import requests
 import sounddevice as sd
 from elevenlabs import ElevenLabs
 from faster_whisper import WhisperModel
@@ -89,6 +90,7 @@ class AssistantConfig:
     llm_backend: str = "lmstudio_api"  # "claude", "lmstudio", or "lmstudio_api"
     lmstudio_model: str = ""  # Model name for LM Studio
     lmstudio_base_url: str = "http://192.168.1.14:1234"  # API URL for LM Studio
+    lmstudio_context_length: int = 4096  # context_length sent to /api/v1/chat
 
     def __post_init__(self) -> None:
         if self.system_prompt_file:
@@ -108,6 +110,13 @@ class AssistantConfig:
             raise ValueError(f"Temperature must be between 0 and 2: {self.temperature}")
         if not self.elevenlabs_voice_id:
             raise ValueError("elevenlabs_voice_id must be set in config.json")
+        if self.llm_backend not in ("claude", "lmstudio", "lmstudio_api"):
+            raise ValueError(
+                f"Invalid llm_backend: {self.llm_backend!r} "
+                "(must be 'claude', 'lmstudio', or 'lmstudio_api')"
+            )
+        if self.llm_backend in ("lmstudio", "lmstudio_api") and not self.lmstudio_model:
+            raise ValueError("lmstudio_model must be set in config.json when llm_backend uses LM Studio")
 
     @classmethod
     def from_json(cls, config_path: str) -> 'AssistantConfig':
@@ -236,13 +245,17 @@ def _with_time_context(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 claude_client = anthropic.Anthropic()   # ANTHROPIC_API_KEY
 el_client = ElevenLabs()               # ELEVENLABS_API_KEY
 
-# LM Studio client for local models
+# LM Studio client for local models — LM Studio serves an OpenAI-compatible
+# /v1/chat/completions endpoint, so the `openai` SDK (not a nonexistent
+# `lmstudio` package) is the client for the "lmstudio" backend. The
+# "lmstudio_api" backend below talks to LM Studio's own /api/v1/chat schema
+# directly over `requests` instead.
 lmstudio_client = None
 try:
-    from lmstudio import LMStudio
-    lmstudio_client = LMStudio(base_url=config.lmstudio_base_url)
+    from openai import OpenAI
+    lmstudio_client = OpenAI(base_url=f"{config.lmstudio_base_url}/v1", api_key="lm-studio")
 except ImportError:
-    logger.warning("LM Studio SDK not available")
+    logger.warning("openai package not available — llm_backend='lmstudio' won't work")
 
 
 # -----------------------------
@@ -1016,6 +1029,38 @@ def _blocks_to_params(content_blocks: list) -> list:
 
 
 # -----------------------------
+# LM Studio /api/v1/chat payload helpers
+# -----------------------------
+def _content_to_text(content) -> str:
+    """Flatten an Anthropic-style content value (string or list of blocks) to plain text."""
+    if isinstance(content, str):
+        return content
+    parts = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block.get("text", ""))
+    return "".join(parts)
+
+
+def _content_to_images(content) -> list:
+    """Pull image blocks out of an Anthropic-style content list as {type, data_url} items."""
+    images = []
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "image":
+                source = block.get("source", {})
+                if source.get("type") == "base64":
+                    media_type = source.get("media_type", "image/png")
+                    images.append({
+                        "type": "image",
+                        "data_url": f"data:{media_type};base64,{source.get('data', '')}",
+                    })
+                elif source.get("type") == "url":
+                    images.append({"type": "image", "data_url": source.get("url", "")})
+    return images
+
+
+# -----------------------------
 # Claude streaming + tool loop + sentence TTS
 # -----------------------------
 def chat_and_speak(messages: List[Dict[str, Any]], speak: bool = True) -> str:
@@ -1046,15 +1091,24 @@ def chat_and_speak(messages: List[Dict[str, Any]], speak: bool = True) -> str:
 
         # Use appropriate backend
         if config.llm_backend == "lmstudio":
+            # OpenAI-compatible chat.completions has no top-level "system"
+            # param (that's Anthropic-specific) — the system prompt has to be
+            # a {"role": "system", ...} message at the front of the array
+            # instead. Built fresh each loop iteration so we don't mutate
+            # (and re-prepend into) the shared working_messages list.
+            lmstudio_messages = list(working_messages)
+            if config.system_prompt:
+                lmstudio_messages.insert(0, {"role": "system", "content": config.system_prompt})
+
             stream_kwargs: dict = dict(
                 model=config.lmstudio_model,
                 max_tokens=config.max_tokens,
-                system=config.system_prompt,
-                messages=working_messages,
+                messages=lmstudio_messages,
                 stream=True,
             )
-            if tools:
-                stream_kwargs["tools"] = tools
+            # Anthropic-shaped tool defs aren't compatible with OpenAI's
+            # function-calling schema, and nothing below parses tool_calls
+            # out of the response anyway — so tools aren't offered here.
 
             # Use LM Studio client
             response = lmstudio_client.chat.completions.create(**stream_kwargs)
@@ -1087,33 +1141,6 @@ def chat_and_speak(messages: List[Dict[str, Any]], speak: bool = True) -> str:
             # "system" role inside it either — system_prompt is a separate
             # top-level string. Tool calls aren't part of this schema, so
             # tool_use/tool_result blocks are dropped rather than forwarded.
-            import requests
-
-            def _content_to_text(content) -> str:
-                if isinstance(content, str):
-                    return content
-                parts = []
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        parts.append(block.get("text", ""))
-                return "".join(parts)
-
-            def _content_to_images(content) -> list:
-                images = []
-                if isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "image":
-                            source = block.get("source", {})
-                            if source.get("type") == "base64":
-                                media_type = source.get("media_type", "image/png")
-                                images.append({
-                                    "type": "image",
-                                    "data_url": f"data:{media_type};base64,{source.get('data', '')}",
-                                })
-                            elif source.get("type") == "url":
-                                images.append({"type": "image", "data_url": source.get("url", "")})
-                return images
-
             input_items: list = []
             system_prompt = config.system_prompt or None
             for msg in working_messages:
@@ -1134,6 +1161,7 @@ def chat_and_speak(messages: List[Dict[str, Any]], speak: bool = True) -> str:
                 "stream": False,
                 "temperature": config.temperature,
                 "max_output_tokens": config.max_tokens,
+                "context_length": config.lmstudio_context_length,
             }
             if system_prompt:
                 stream_kwargs["system_prompt"] = system_prompt
