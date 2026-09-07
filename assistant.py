@@ -1045,7 +1045,7 @@ def chat_and_speak(messages: List[Dict[str, Any]], speak: bool = True) -> str:
         search_announced = False
 
         # Use appropriate backend
-        if config.llm_backend == "lmstudio":
+        if config.llm_backend == "lmstudio_api":
             stream_kwargs: dict = dict(
                 model=config.lmstudio_model,
                 max_tokens=config.max_tokens,
