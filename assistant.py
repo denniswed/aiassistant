@@ -1136,7 +1136,7 @@ def chat_and_speak(messages: List[Dict[str, Any]], speak: bool = True) -> str:
             break
         elif config.llm_backend == "lmstudio_api":
             # Use LM Studio HTTP API — /api/v1/chat takes a single top-level
-            # "input" field (a string, or an array of {type:"message"/"image"}
+            # "input" field (a string, or an array of {type:"text"/"image"}
             # parts), not an Anthropic-style "messages" array. There is no
             # "system" role inside it either — system_prompt is a separate
             # top-level string. Tool calls aren't part of this schema, so
@@ -1152,7 +1152,11 @@ def chat_and_speak(messages: List[Dict[str, Any]], speak: bool = True) -> str:
                     continue
                 text = _content_to_text(content)
                 if text:
-                    input_items.append({"type": "message", "content": text})
+                    # Server-confirmed: the input array's discriminator is
+                    # "text"/"image" — "message" (from the task's schema
+                    # write-up) is actually the *output* array's type and
+                    # was rejected here with invalid_union/invalid_discriminator.
+                    input_items.append({"type": "text", "content": text})
                 input_items.extend(_content_to_images(content))
 
             stream_kwargs = {
