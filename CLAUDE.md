@@ -71,6 +71,8 @@ Copy `config.json.example` to `config.json`. Notable fields (see `AssistantConfi
 | `system_prompt_file` | Path to a prompt file; overrides the inline default (`system_prompt.txt`) |
 | `claude_model` | e.g. `claude-opus-4-8` |
 | `max_tokens` | On truncation the assistant **auto-continues** rather than stopping |
+| `llm_backend` | `"claude"` (default), `"lmstudio"`, or `"lmstudio_api"` — see LM Studio backends below |
+| `lmstudio_model`, `lmstudio_base_url`, `lmstudio_context_length` | Only used when `llm_backend` is one of the LM Studio options. `lmstudio_model` **required** in that case — `__post_init__` raises if empty |
 | `elevenlabs_voice_id` | **Required** — `__post_init__` raises if empty |
 | `elevenlabs_model_id` | Default `eleven_turbo_v2` |
 | `whisper_model_size` / `whisper_compute_type` | `int8` for CPU, `float16` for GPU |
@@ -101,6 +103,24 @@ Functions reference `config` directly rather than taking it as a parameter.
 
 `_blocks_to_params` converts SDK content-block objects back into plain dicts for the next
 API call (needed because the tool loop re-sends prior assistant turns).
+
+**LM Studio backends** (`config.llm_backend`) are an alternative to steps 1–4 above for
+running a local model instead of Claude — tools and the tool loop, `max_tokens`
+auto-continue, and the timestamp header from `_with_time_context` only apply to the
+`"claude"` path.
+- `"lmstudio"` — LM Studio's OpenAI-compatible `/v1/chat/completions` endpoint via the
+  `openai` SDK (`lmstudio_client`). System prompt is prepended as a `{"role": "system"}`
+  message (OpenAI's API has no top-level `system` param); no tools are offered since
+  nothing here parses `tool_calls` out of the response.
+- `"lmstudio_api"` — LM Studio's own `/api/v1/chat` schema (`_content_to_text` /
+  `_content_to_images` convert message history into it) via plain `requests`, called
+  non-streaming. This schema has no messages array, no system role, and no tool-calling —
+  `system_prompt` is a separate top-level string and the response is read from
+  `output[]` items of type `"message"`.
+
+Both LM Studio paths just print + speak the reply and `break`, skipping the tool loop and
+`max_tokens` auto-continue entirely — they're for simple local-model chat, not full parity
+with the Claude path.
 
 **Three input paths converge on `_process_input`:**
 - **PTT** — `pynput` `on_press`/`on_release` on Right Shift drive a `Recorder`
