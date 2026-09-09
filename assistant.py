@@ -1152,7 +1152,7 @@ def chat_and_speak(messages: List[Dict[str, Any]], speak: bool = True) -> str:
                     continue
                 text = _content_to_text(content)
                 if text:
-                    input_items.append({"type": "message", "content": text})
+                    input_items.append({"type": "text", "content": text})
                 input_items.extend(_content_to_images(content))
 
             stream_kwargs = {
